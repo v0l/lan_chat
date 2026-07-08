@@ -9,7 +9,11 @@ link — no server, no discovery service, **IPv6 only**.
 - **IPv6-only** UDP multicast (`set_only_v6(true)`, transient group `ff12::4c41:4e43`).
 - **Text chat** broadcast to the whole group.
 - **Voice** — mic capture + speaker playback via `cpal`, 48 kHz mono, ~20 ms
-  frames, concurrent speakers mixed together.
+  frames. Each source is loudness-normalised (basic RMS-target AGC) and
+  concurrent speakers are mixed with **equal weight** (averaged over active
+  speakers) so simultaneous talkers stay balanced and don't clip.
+- **Device selection** — pick input (mic) and output (speaker) devices at
+  runtime from the sidebar, with a refresh button to rescan.
 - **Presence** — join/leave notices, live peer list, "speaking" indicator.
 - **GUI** built with `egui`/`eframe`.
 

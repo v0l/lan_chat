@@ -34,6 +34,9 @@ pub struct ChatApp {
     peers: HashMap<u64, Peer>,
     last_hello: Instant,
     scroll_to_bottom: bool,
+
+    input_devices: Vec<String>,
+    output_devices: Vec<String>,
 }
 
 impl ChatApp {
@@ -47,6 +50,8 @@ impl ChatApp {
         };
 
         ChatApp {
+            input_devices: crate::audio::list_input_devices(),
+            output_devices: crate::audio::list_output_devices(),
             peer_id,
             name,
             net,
@@ -107,7 +112,7 @@ impl ChatApp {
                         p.speaking_until = now + Duration::from_millis(300);
                     }
                     if let Some(v) = &self.voice {
-                        v.playback.push_frame(&pcm, v.out_rate);
+                        v.playback.push_frame(env.peer_id, &pcm, v.out_rate);
                     }
                 }
             }
@@ -192,11 +197,82 @@ impl eframe::App for ChatApp {
             );
 
             ui.add_space(8.0);
+            ui.heading("Voice");
             match &mut self.voice {
                 Some(v) => {
                     let mut on = v.mic_on();
                     if ui.checkbox(&mut on, "🎤 Transmit voice").changed() {
                         if let Err(e) = v.set_mic(on) {
+                            self.voice_err = Some(e);
+                        }
+                    }
+
+                    ui.add_space(6.0);
+                    if ui.small_button("⟳ refresh devices").clicked() {
+                        self.input_devices = crate::audio::list_input_devices();
+                        self.output_devices = crate::audio::list_output_devices();
+                    }
+
+                    // Input device selector.
+                    ui.label(egui::RichText::new("Input").small().weak());
+                    let cur_in = v
+                        .input_name()
+                        .clone()
+                        .unwrap_or_else(|| "Default".to_string());
+                    let mut new_in: Option<Option<String>> = None;
+                    egui::ComboBox::from_id_source("input_dev")
+                        .width(160.0)
+                        .selected_text(cur_in.clone())
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(v.input_name().is_none(), "Default")
+                                .clicked()
+                            {
+                                new_in = Some(None);
+                            }
+                            for d in &self.input_devices {
+                                if ui
+                                    .selectable_label(v.input_name().as_deref() == Some(d), d)
+                                    .clicked()
+                                {
+                                    new_in = Some(Some(d.clone()));
+                                }
+                            }
+                        });
+                    if let Some(sel) = new_in {
+                        if let Err(e) = v.set_input(sel) {
+                            self.voice_err = Some(e);
+                        }
+                    }
+
+                    // Output device selector.
+                    ui.label(egui::RichText::new("Output").small().weak());
+                    let cur_out = v
+                        .output_name()
+                        .clone()
+                        .unwrap_or_else(|| "Default".to_string());
+                    let mut new_out: Option<Option<String>> = None;
+                    egui::ComboBox::from_id_source("output_dev")
+                        .width(160.0)
+                        .selected_text(cur_out.clone())
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(v.output_name().is_none(), "Default")
+                                .clicked()
+                            {
+                                new_out = Some(None);
+                            }
+                            for d in &self.output_devices {
+                                if ui
+                                    .selectable_label(v.output_name().as_deref() == Some(d), d)
+                                    .clicked()
+                                {
+                                    new_out = Some(Some(d.clone()));
+                                }
+                            }
+                        });
+                    if let Some(sel) = new_out {
+                        if let Err(e) = v.set_output(sel) {
                             self.voice_err = Some(e);
                         }
                     }
