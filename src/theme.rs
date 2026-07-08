@@ -124,6 +124,13 @@ pub fn label_font() -> FontId {
     FontId::new(11.0, FontFamily::Monospace)
 }
 
+/// A small filled status dot, drawn (not a font glyph, which may be missing).
+pub fn status_dot(ui: &mut Ui, color: Color32) {
+    let d = 10.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(d, d), Sense::hover());
+    ui.painter().circle_filled(rect.center(), d * 0.35, color);
+}
+
 /// A compact horizontal level meter (0..1), full available width.
 ///
 /// Teal while nominal, amber when hot (>0.7), red near clip (>0.9) — so a

@@ -384,7 +384,7 @@ impl ChatApp {
         Container::titled("Peers").show(ui, |ui| {
             // Yourself, always first and in the accent colour.
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("●").color(theme::ACCENT));
+                theme::status_dot(ui, theme::ACCENT);
                 ui.label(egui::RichText::new(&self.name).color(theme::ACCENT).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
@@ -404,7 +404,7 @@ impl ChatApp {
                 let speaking = p.speaking_until > now;
                 ui.horizontal(|ui| {
                     let dot = if speaking { theme::ACCENT } else { theme::BORDER };
-                    ui.label(egui::RichText::new("●").color(dot));
+                    theme::status_dot(ui, dot);
                     ui.label(egui::RichText::new(&p.name).color(theme::PEER_NAME));
                     if speaking {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -461,8 +461,8 @@ impl ChatApp {
             match &self.voice {
                 Some(v) => {
                     let on = v.mic_on();
-                    // Stateful primary control: teal while transmitting.
-                    let label = if on { "◉  Transmitting" } else { "◎  Transmit voice" };
+                    // Stateful primary control: teal fill while transmitting.
+                    let label = if on { "Transmitting…" } else { "Transmit voice" };
                     let btn = egui::Button::new(
                         egui::RichText::new(label)
                             .color(if on { theme::ON_ACCENT } else { theme::TEXT }),
@@ -521,7 +521,7 @@ impl ChatApp {
                     ui.add_space(8.0);
                     if ui
                         .add(egui::Button::new(
-                            egui::RichText::new("⟳  Rescan devices").color(theme::MUTED),
+                            egui::RichText::new("Rescan devices").color(theme::MUTED),
                         ))
                         .clicked()
                     {
