@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>LAN Chat</string>
+    <key>CFBundleDisplayName</key>
+    <string>LAN Chat</string>
+    <key>CFBundleIdentifier</key>
+    <string>network.harkin.lanchat</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>lan_chat</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>LAN Chat uses the microphone to transmit voice to peers on your local network.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>LAN Chat uses IPv6 multicast to discover and talk to peers on your local network.</string>
+</dict>
+</plist>
