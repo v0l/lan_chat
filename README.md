@@ -14,6 +14,17 @@ link — no server, no discovery service, **IPv6 only**.
   speakers) so simultaneous talkers stay balanced and don't clip.
 - **Device selection** — pick input (mic) and output (speaker) devices at
   runtime from the sidebar, with a refresh button to rescan.
+- **Level meters (VU)** — an outbound meter while you transmit, plus a per-peer
+  inbound meter so you can see at a glance that you're actually receiving each
+  participant's audio.
+- **Themed UI** — a compact "network console" look (dark cool surfaces, hairline
+  cards, a single signal-teal accent reserved for live state) built on a
+  reusable `Container` card widget and a token system in `src/theme.rs`.
+
+## Logging
+
+Uses `env_logger`. Defaults to `info` for the app and `warn` for the noisy GUI
+stack. Override with `RUST_LOG`, e.g. `RUST_LOG=lan_chat=debug cargo run`.
 - **Presence** — join/leave notices, live peer list, "speaking" indicator.
 - **GUI** built with `egui`/`eframe`.
 

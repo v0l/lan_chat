@@ -221,6 +221,32 @@ fn render_upmixes_mono_to_multichannel() {
 }
 
 #[test]
+fn cue_is_audible_over_silence() {
+    // A notification cue must produce sound even when no one is speaking.
+    let rate = SAMPLE_RATE;
+    let mut mixer = Mixer::new(rate);
+    let cue = audio::synth_cue(audio::Cue::Join, rate);
+    assert!(!cue.is_empty(), "cue synth produced nothing");
+    mixer.push_sfx(&cue);
+    let mut out = vec![0.0f32; cue.len()];
+    mixer.render(&mut out, 1);
+    assert!(rms(&out) > 0.02, "cue was not audible (rms={})", rms(&out));
+}
+
+#[test]
+fn cue_mixes_on_top_of_voice() {
+    // Cue + a speaker should both be present (cue bypasses AGC, adds on top).
+    let rate = SAMPLE_RATE;
+    let mut mixer = Mixer::new(rate);
+    let tone = sine(300.0, rate, 1, 0.05, 0.2);
+    mixer.push_frame(1, &tone[..FRAME_SAMPLES]);
+    mixer.push_sfx(&audio::synth_cue(audio::Cue::Message, rate));
+    let mut out = vec![0.0f32; FRAME_SAMPLES];
+    mixer.render(&mut out, 1);
+    assert!(rms(&out) > 0.02, "combined output silent");
+}
+
+#[test]
 fn idle_mixer_outputs_silence() {
     let mut mixer = Mixer::new(SAMPLE_RATE);
     let mut out = vec![1.0f32; FRAME_SAMPLES];

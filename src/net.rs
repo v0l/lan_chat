@@ -96,7 +96,7 @@ fn spawn_reader(socket: Arc<Socket>, tx: Sender<(Envelope, SocketAddr)>) {
                         if e.kind() == io::ErrorKind::Interrupted {
                             continue;
                         }
-                        eprintln!("net reader error: {e}");
+                        log::error!("net reader error: {e}");
                         break;
                     }
                 }

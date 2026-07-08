@@ -10,6 +10,7 @@ mod app;
 mod audio;
 mod net;
 mod protocol;
+mod theme;
 
 use std::net::Ipv6Addr;
 use std::str::FromStr;
@@ -66,24 +67,37 @@ fn parse_args() -> Args {
 }
 
 fn main() -> eframe::Result<()> {
+    // Logging: default to info for our crate, quieter for the noisy GUI stack.
+    // Override anytime with RUST_LOG, e.g. `RUST_LOG=lan_chat=debug`.
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or("info,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,eframe=warn,egui_winit=warn,winit=warn,naga=warn"),
+    )
+    .format_timestamp_millis()
+    .init();
+
     let args = parse_args();
     let peer_id: u64 = rand::random();
 
     let net = match Net::join(args.group, args.port, args.iface) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("Failed to join IPv6 multicast group [{}]:{}", args.group, args.port);
-            eprintln!("  {e}");
-            eprintln!("Hint: ensure the interface has IPv6 enabled. Try --iface INDEX");
-            eprintln!("      (see `ip -6 addr`; index from `ip link`).");
+            log::error!("failed to join IPv6 multicast group [{}]:{}: {e}", args.group, args.port);
+            log::error!("ensure the interface has IPv6 enabled; try --iface INDEX (see `ip -6 addr` / `ip link`)");
             std::process::exit(1);
         }
     };
 
-    println!(
-        "Joined [{}]:{} as \"{}\" (peer {:016x})",
+    log::info!(
+        "joined [{}]:{} as \"{}\" (peer {:016x})",
         args.group, args.port, args.name, peer_id
     );
+
+    // Audio devices are a common source of "no sound": cpal uses ALSA's
+    // "default", which on PipeWire/Pulse may not be your active sink. Log the
+    // options so you can pick the right Output in the Voice panel.
+    log::info!("output devices: {:?}", audio::list_output_devices());
+    log::info!("input devices: {:?}", audio::list_input_devices());
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -96,6 +110,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "lan_chat",
         options,
-        Box::new(move |_cc| Ok(Box::new(ChatApp::new(peer_id, name, net)))),
+        Box::new(move |cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(ChatApp::new(peer_id, name, net)))
+        }),
     )
 }

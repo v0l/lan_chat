@@ -128,15 +128,71 @@ fn normalize_in_place(samples: &mut [f32], gain: &mut f32) {
     }
 }
 
-/// Equal-weight, per-source-normalised mixer targeting `rate` Hz.
+/// A short UI notification sound.
+#[derive(Clone, Copy, Debug)]
+pub enum Cue {
+    Join,
+    Leave,
+    Message,
+}
+
+fn envelope(i: usize, n: usize) -> f32 {
+    // Raised-cosine window so tones fade in/out without clicks.
+    let x = i as f32 / n.max(1) as f32;
+    (std::f32::consts::PI * x).sin()
+}
+
+fn tone(freq: f32, secs: f32, amp: f32, rate: u32, out: &mut Vec<f32>) {
+    let n = (rate as f32 * secs) as usize;
+    for i in 0..n {
+        let t = i as f32 / rate as f32;
+        out.push((2.0 * std::f32::consts::PI * freq * t).sin() * amp * envelope(i, n));
+    }
+}
+
+/// Synthesise a cue as mono PCM at `rate`.
+pub fn synth_cue(cue: Cue, rate: u32) -> Vec<f32> {
+    let mut out = Vec::new();
+    let a = 0.22;
+    match cue {
+        // Rising two-tone: someone arrived.
+        Cue::Join => {
+            tone(659.25, 0.08, a, rate, &mut out);
+            tone(987.77, 0.12, a, rate, &mut out);
+        }
+        // Falling two-tone: someone left.
+        Cue::Leave => {
+            tone(880.0, 0.08, a, rate, &mut out);
+            tone(587.33, 0.12, a, rate, &mut out);
+        }
+        // Single soft blip: a message.
+        Cue::Message => {
+            tone(880.0, 0.06, a * 0.8, rate, &mut out);
+        }
+    }
+    out
+}
+
+/// Equal-weight, per-source-normalised mixer targeting `rate` Hz, plus an
+/// independent (non-normalised) channel for short UI cues.
 pub struct Mixer {
     sources: HashMap<u64, Source>,
+    sfx: VecDeque<f32>,
     rate: u32,
 }
 
 impl Mixer {
     pub fn new(rate: u32) -> Self {
-        Mixer { sources: HashMap::new(), rate }
+        Mixer { sources: HashMap::new(), sfx: VecDeque::new(), rate }
+    }
+
+    /// Queue a UI cue (mixed on top of voice, bypassing AGC).
+    pub fn push_sfx(&mut self, samples: &[f32]) {
+        // Cap to ~2 s so rapid cues can't build a backlog.
+        if self.sfx.len() > (self.rate as usize) * 2 {
+            self.sfx.clear();
+        }
+        self.sfx.extend(samples.iter().copied());
     }
 
     /// Enqueue a 48 kHz mono frame from remote speaker `peer_id`.
@@ -180,7 +236,10 @@ impl Mixer {
                     active += 1;
                 }
             }
-            let v = if active > 0 { sum / active as f32 } else { 0.0 };
+            let voice = if active > 0 { sum / active as f32 } else { 0.0 };
+            // Mix the UI cue channel on top of voice.
+            let cue = self.sfx.pop_front().unwrap_or(0.0);
+            let v = (voice + cue).clamp(-1.0, 1.0);
             for o in frame.iter_mut() {
                 *o = v;
             }
@@ -197,18 +256,30 @@ fn device_name(d: &Device) -> Option<String> {
     d.description().ok().map(|desc| desc.name().to_string())
 }
 
+/// Deduplicate ALSA's noisy enumeration (every subdevice repeats a name) and
+/// drop the null "Discard all samples" device, so the picker is usable.
+fn clean(names: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    names
+        .filter(|n| !n.starts_with("Discard all samples"))
+        .filter(|n| seen.insert(n.clone()))
+        .collect()
+}
+
 pub fn list_input_devices() -> Vec<String> {
-    cpal::default_host()
-        .input_devices()
-        .map(|it| it.filter_map(|d| device_name(&d)).collect())
-        .unwrap_or_default()
+    let host = cpal::default_host();
+    match host.input_devices() {
+        Ok(it) => clean(it.filter_map(|d| device_name(&d))),
+        Err(_) => Vec::new(),
+    }
 }
 
 pub fn list_output_devices() -> Vec<String> {
-    cpal::default_host()
-        .output_devices()
-        .map(|it| it.filter_map(|d| device_name(&d)).collect())
-        .unwrap_or_default()
+    let host = cpal::default_host();
+    match host.output_devices() {
+        Ok(it) => clean(it.filter_map(|d| device_name(&d))),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn find_input_device(name: &str) -> Option<Device> {
@@ -261,7 +332,7 @@ where
     T: SizedSample,
     f32: FromSample<T>,
 {
-    let err_fn = |e| eprintln!("input stream error: {e}");
+    let err_fn = |e| log::error!("input stream error: {e}");
     device
         .build_input_stream(
             config.clone(),
@@ -288,13 +359,26 @@ impl Capture {
         let config: StreamConfig = default.config();
         let framer = Framer::new(dev_rate, channels);
 
-        let stream = match fmt {
-            SampleFormat::F32 => build_input_stream::<f32>(device, &config, framer, frames_out)?,
-            SampleFormat::I16 => build_input_stream::<i16>(device, &config, framer, frames_out)?,
-            SampleFormat::U16 => build_input_stream::<u16>(device, &config, framer, frames_out)?,
-            other => return Err(format!("unsupported input sample format: {other:?}")),
-        };
+        macro_rules! build_in {
+            ($($v:ident => $t:ty),+ $(,)?) => {
+                match fmt {
+                    $(SampleFormat::$v => build_input_stream::<$t>(device, &config, framer, frames_out)?,)+
+                    other => return Err(format!(
+                        "unsupported input sample format: {other:?} (try a different Input device)"
+                    )),
+                }
+            };
+        }
+        let stream = build_in!(
+            F32 => f32, F64 => f64,
+            I8 => i8, I16 => i16, I32 => i32, I64 => i64,
+            U8 => u8, U16 => u16, U32 => u32, U64 => u64,
+        );
         stream.play().map_err(|e| format!("play input: {e}"))?;
+        log::info!(
+            "capture: device={:?} rate={dev_rate}Hz channels={channels} fmt={fmt:?}",
+            device_name(device).unwrap_or_else(|| "<unknown>".into())
+        );
         Ok(Capture { _stream: stream })
     }
 }
@@ -320,17 +404,39 @@ fn build_output_stream<T>(
 where
     T: SizedSample + FromSample<f32>,
 {
-    let err_fn = |e| eprintln!("output stream error: {e}");
+    let err_fn = |e| log::error!("output stream error: {e}");
     let mut scratch: Vec<f32> = Vec::new();
+    // Diagnostics: prove the output callback is firing and whether it's pulling
+    // non-silent audio out of the mixer.
+    let mut dbg_at = std::time::Instant::now();
+    let mut dbg_calls: u64 = 0;
+    let mut dbg_peak: f32 = 0.0;
     device
         .build_output_stream(
             config.clone(),
             move |data: &mut [T], _| {
-                scratch.clear();
-                scratch.resize(data.len(), 0.0);
-                mixer.lock().unwrap().render(&mut scratch, channels);
+                let active = {
+                    let mut m = mixer.lock().unwrap();
+                    let a = m.active_sources();
+                    scratch.clear();
+                    scratch.resize(data.len(), 0.0);
+                    m.render(&mut scratch, channels);
+                    a
+                };
                 for (o, s) in data.iter_mut().zip(scratch.iter()) {
                     *o = T::from_sample(*s);
+                }
+                dbg_calls += 1;
+                for s in scratch.iter() {
+                    dbg_peak = dbg_peak.max(s.abs());
+                }
+                if dbg_at.elapsed().as_millis() >= 1000 {
+                    log::debug!(
+                        "output cb: {dbg_calls}/s, active_speakers={active}, peak_out={dbg_peak:.3}"
+                    );
+                    dbg_calls = 0;
+                    dbg_peak = 0.0;
+                    dbg_at = std::time::Instant::now();
                 }
             },
             err_fn,
@@ -351,14 +457,27 @@ impl Playback {
 
         let mixer: SharedMixer = Arc::new(Mutex::new(Mixer::new(rate)));
 
-        let stream = match fmt {
-            SampleFormat::F32 => build_output_stream::<f32>(device, &config, channels, mixer.clone())?,
-            SampleFormat::I16 => build_output_stream::<i16>(device, &config, channels, mixer.clone())?,
-            SampleFormat::U16 => build_output_stream::<u16>(device, &config, channels, mixer.clone())?,
-            other => return Err(format!("unsupported output sample format: {other:?}")),
-        };
+        macro_rules! build_out {
+            ($($v:ident => $t:ty),+ $(,)?) => {
+                match fmt {
+                    $(SampleFormat::$v => build_output_stream::<$t>(device, &config, channels, mixer.clone())?,)+
+                    other => return Err(format!(
+                        "unsupported output sample format: {other:?} (pick a different Output device)"
+                    )),
+                }
+            };
+        }
+        let stream = build_out!(
+            F32 => f32, F64 => f64,
+            I8 => i8, I16 => i16, I32 => i32, I64 => i64,
+            U8 => u8, U16 => u16, U32 => u32, U64 => u64,
+        );
         stream.play().map_err(|e| format!("play output: {e}"))?;
 
+        log::info!(
+            "playback: device={:?} rate={rate}Hz channels={channels} fmt={fmt:?}",
+            device_name(device).unwrap_or_else(|| "<unknown>".into())
+        );
         Ok(Playback { _stream: stream, mixer, rate })
     }
 
@@ -369,6 +488,12 @@ impl Playback {
     /// Enqueue a 48 kHz mono frame from remote speaker `peer_id`.
     pub fn push_frame(&self, peer_id: u64, pcm_48k_mono: &[f32]) {
         self.mixer.lock().unwrap().push_frame(peer_id, pcm_48k_mono);
+    }
+
+    /// Play a short UI notification cue.
+    pub fn play_cue(&self, cue: Cue) {
+        let samples = synth_cue(cue, self.rate);
+        self.mixer.lock().unwrap().push_sfx(&samples);
     }
 }
 
