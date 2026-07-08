@@ -25,6 +25,8 @@ pub enum Payload {
     Bye { name: String },
     /// Text chat line.
     Text { name: String, body: String },
+    /// An emote / action ("/me waves").
+    Emote { name: String, action: String },
     /// One frame of mono f32 PCM at SAMPLE_RATE.
     Voice { name: String, seq: u32, pcm: Vec<f32> },
 }
@@ -35,11 +37,11 @@ impl Envelope {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("serialize envelope")
+        postcard::to_allocvec(self).expect("serialize envelope")
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let env: Envelope = bincode::deserialize(bytes).ok()?;
+        let env: Envelope = postcard::from_bytes(bytes).ok()?;
         if env.magic != MAGIC {
             return None;
         }

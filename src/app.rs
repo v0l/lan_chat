@@ -34,6 +34,7 @@ pub struct ChatApp {
     peers: HashMap<u64, Peer>,
     last_hello: Instant,
     scroll_to_bottom: bool,
+    quit: bool,
 
     input_devices: Vec<String>,
     output_devices: Vec<String>,
@@ -50,6 +51,7 @@ impl ChatApp {
         };
 
         ChatApp {
+            quit: false,
             input_devices: crate::audio::list_input_devices(),
             output_devices: crate::audio::list_output_devices(),
             peer_id,
@@ -71,14 +73,105 @@ impl ChatApp {
         if body.is_empty() {
             return;
         }
+        self.draft.clear();
+
+        // A leading '/' (but not '//') is a chat command.
+        if let Some(rest) = body.strip_prefix('/') {
+            if !rest.starts_with('/') {
+                self.handle_command(rest);
+                return;
+            }
+            // "//text" escapes to a literal message starting with '/'.
+            let body = rest.to_string();
+            self.broadcast_text(body);
+            return;
+        }
+        self.broadcast_text(body);
+    }
+
+    fn broadcast_text(&mut self, body: String) {
         let env = Envelope::new(
             self.peer_id,
             Payload::Text { name: self.name.clone(), body: body.clone() },
         );
         let _ = self.net.send(&env);
         self.log.push(ChatLine { who: self.name.clone(), body, mine: true });
-        self.draft.clear();
         self.scroll_to_bottom = true;
+    }
+
+    /// Push a local-only system line (not sent over the network).
+    fn sys(&mut self, msg: impl Into<String>) {
+        self.log.push(ChatLine { who: "*".into(), body: msg.into(), mine: false });
+        self.scroll_to_bottom = true;
+    }
+
+    fn handle_command(&mut self, cmd: &str) {
+        let mut parts = cmd.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("").to_lowercase();
+        let arg = parts.next().unwrap_or("").trim().to_string();
+
+        match name.as_str() {
+            "name" | "nick" => {
+                if arg.is_empty() {
+                    self.sys("usage: /name <new name>");
+                } else {
+                    let old = std::mem::replace(&mut self.name, arg.clone());
+                    let _ = self.net.send(&Envelope::new(
+                        self.peer_id,
+                        Payload::Hello { name: self.name.clone() },
+                    ));
+                    self.sys(format!("{old} is now known as {arg}"));
+                }
+            }
+            "me" => {
+                if arg.is_empty() {
+                    self.sys("usage: /me <action>");
+                } else {
+                    let _ = self.net.send(&Envelope::new(
+                        self.peer_id,
+                        Payload::Emote { name: self.name.clone(), action: arg.clone() },
+                    ));
+                    self.sys(format!("{} {}", self.name, arg));
+                }
+            }
+            "mic" => {
+                let want = match arg.to_lowercase().as_str() {
+                    "on" | "1" | "true" => Some(true),
+                    "off" | "0" | "false" => Some(false),
+                    "" => self.voice.as_ref().map(|v| !v.mic_on()),
+                    _ => None,
+                };
+                match (want, self.voice.as_mut()) {
+                    (Some(on), Some(v)) => match v.set_mic(on) {
+                        Ok(()) => self.sys(if on { "microphone on" } else { "microphone off" }),
+                        Err(e) => self.sys(format!("mic error: {e}")),
+                    },
+                    (Some(_), None) => self.sys("voice unavailable"),
+                    (None, _) => self.sys("usage: /mic [on|off]"),
+                }
+            }
+            "peers" => {
+                let mut names: Vec<String> = self.peers.values().map(|p| p.name.clone()).collect();
+                names.sort();
+                if names.is_empty() {
+                    self.sys("no other peers on the group");
+                } else {
+                    self.sys(format!("{} peer(s): {}", names.len(), names.join(", ")));
+                }
+            }
+            "clear" => {
+                self.log.clear();
+            }
+            "quit" | "exit" => {
+                self.quit = true;
+            }
+            "help" | "?" => {
+                self.sys("commands: /name <n>, /me <action>, /mic [on|off], /peers, /clear, /quit, /help");
+            }
+            other => {
+                self.sys(format!("unknown command: /{other}  (try /help)"));
+            }
+        }
     }
 
     fn pump_network(&mut self) {
@@ -106,13 +199,22 @@ impl ChatApp {
                     self.log.push(ChatLine { who: name, body, mine: false });
                     self.scroll_to_bottom = true;
                 }
+                Payload::Emote { name, action } => {
+                    self.touch_peer(env.peer_id, &name, now);
+                    self.log.push(ChatLine {
+                        who: "*".into(),
+                        body: format!("{name} {action}"),
+                        mine: false,
+                    });
+                    self.scroll_to_bottom = true;
+                }
                 Payload::Voice { name, seq: _, pcm } => {
                     self.touch_peer(env.peer_id, &name, now);
                     if let Some(p) = self.peers.get_mut(&env.peer_id) {
                         p.speaking_until = now + Duration::from_millis(300);
                     }
                     if let Some(v) = &self.voice {
-                        v.playback.push_frame(env.peer_id, &pcm, v.out_rate);
+                        v.playback.push_frame(env.peer_id, &pcm);
                     }
                 }
             }
@@ -172,12 +274,23 @@ impl ChatApp {
 }
 
 impl eframe::App for ChatApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_network();
         self.pump_voice();
         self.housekeeping();
+        if self.quit {
+            let _ = self.net.send(&Envelope::new(
+                self.peer_id,
+                Payload::Bye { name: self.name.clone() },
+            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // Keep polling network/voice even when idle.
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
 
-        egui::SidePanel::right("peers").min_width(180.0).show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::containers::Panel::right("peers").default_size(200.0).show(ui, |ui| {
             ui.heading("Peers");
             ui.separator();
             ui.label(egui::RichText::new(format!("● {} (you)", self.name)).strong());
@@ -220,7 +333,7 @@ impl eframe::App for ChatApp {
                         .clone()
                         .unwrap_or_else(|| "Default".to_string());
                     let mut new_in: Option<Option<String>> = None;
-                    egui::ComboBox::from_id_source("input_dev")
+                    egui::ComboBox::from_id_salt("input_dev")
                         .width(160.0)
                         .selected_text(cur_in.clone())
                         .show_ui(ui, |ui| {
@@ -252,7 +365,7 @@ impl eframe::App for ChatApp {
                         .clone()
                         .unwrap_or_else(|| "Default".to_string());
                     let mut new_out: Option<Option<String>> = None;
-                    egui::ComboBox::from_id_source("output_dev")
+                    egui::ComboBox::from_id_salt("output_dev")
                         .width(160.0)
                         .selected_text(cur_out.clone())
                         .show_ui(ui, |ui| {
@@ -286,7 +399,7 @@ impl eframe::App for ChatApp {
             }
         });
 
-        egui::TopBottomPanel::bottom("compose").show(ctx, |ui| {
+        egui::containers::Panel::bottom("compose").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let resp = ui.add(
@@ -307,7 +420,7 @@ impl eframe::App for ChatApp {
             ui.add_space(4.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::containers::CentralPanel::default().show(ui, |ui| {
             ui.heading("LAN Chat  ·  IPv6 multicast");
             ui.separator();
             let mut scroll = egui::ScrollArea::vertical().auto_shrink([false; 2]);
@@ -335,12 +448,9 @@ impl eframe::App for ChatApp {
             });
             self.scroll_to_bottom = false;
         });
-
-        // Keep polling network/voice even when idle.
-        ctx.request_repaint_after(Duration::from_millis(50));
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         let _ = self
             .net
             .send(&Envelope::new(self.peer_id, Payload::Bye { name: self.name.clone() }));

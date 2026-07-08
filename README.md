@@ -47,6 +47,20 @@ cargo run --release -- bob
 
 Type to chat. Tick **🎤 Transmit voice** to talk.
 
+### Chat commands
+
+Lines beginning with `/` are commands (use `//` to send a literal leading slash):
+
+| Command | Action |
+|---------|--------|
+| `/name <n>` (`/nick`) | Change your display name and re-announce to peers |
+| `/me <action>` | Send an emote (`* alice waves`) |
+| `/mic [on\|off]` | Toggle or set voice transmission (no arg = toggle) |
+| `/peers` | List peers currently on the group |
+| `/clear` | Clear your local chat log |
+| `/quit` (`/exit`) | Announce departure and close |
+| `/help` (`/?`) | List commands |
+
 ### Choosing an interface
 
 Link-local/transient multicast needs the right interface. If auto (`0`) doesn't
@@ -62,6 +76,12 @@ cargo run --release -- alice --iface 2
 ```sh
 cargo test --test multicast   # two peers exchange a message over the group
 ```
+
+## Serialization
+
+Wire messages use [`postcard`](https://crates.io/crates/postcard) (a compact,
+actively-maintained `serde` format) — bincode's final release is a maintenance
+tombstone, so postcard is the recommended modern replacement.
 
 ## Notes / limitations
 

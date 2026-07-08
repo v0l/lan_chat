@@ -1,20 +1,24 @@
 //! Voice capture and playback via cpal.
 //!
-//! Capture: chosen device's native config -> downmix to mono -> resample to
-//! 48 kHz -> emit ~20 ms frames.
+//! The signal processing is split into two hardware-independent, unit-testable
+//! pieces:
 //!
-//! Playback: keeps one jitter buffer **per remote speaker**. Each incoming
-//! source is loudness-normalised (basic RMS-targeting AGC) so quiet and loud
-//! mics come out at a comparable level, then the output callback mixes all
-//! currently-active speakers with **equal weight** by averaging over the number
-//! of active sources — so N people talking at once stays at a sane volume
-//! instead of summing into clipping.
+//! * [`Framer`] — turns a device's interleaved PCM (any rate/channel count)
+//!   into 48 kHz mono frames of [`FRAME_SAMPLES`] samples.
+//! * [`Mixer`] — keeps one jitter buffer per remote speaker, loudness-normalises
+//!   each source (basic RMS-target AGC), and mixes active speakers with equal
+//!   weight (averaged over the active count) so simultaneous talkers stay level
+//!   and never clip.
+//!
+//! [`Capture`]/[`Playback`] are thin cpal wrappers around those. Crucially they
+//! honour the device's native **sample format** (I16/U16/F32), converting to and
+//! from f32 — a mismatch here is the usual cause of "no audio".
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Stream, StreamConfig};
+use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::protocol::SAMPLE_RATE;
@@ -30,7 +34,7 @@ const NOISE_GATE: f32 = 0.01; // below this a frame is treated as silence
 const GAIN_SMOOTH: f32 = 0.15; // envelope follower speed (0..1)
 
 /// Linear-interpolation resampler (good enough for speech).
-fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
+pub(crate) fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
     if from == to || input.is_empty() {
         return input.to_vec();
     }
@@ -49,7 +53,7 @@ fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
 }
 
 /// Downmix interleaved frames to mono by averaging channels.
-fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
+pub(crate) fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return interleaved.to_vec();
     }
@@ -59,19 +63,151 @@ fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
+// ---- Framer (capture-side DSP, hardware independent) ------------------------
+
+/// Converts interleaved device PCM into 48 kHz mono frames.
+pub struct Framer {
+    dev_rate: u32,
+    channels: usize,
+    pending: Vec<f32>,
+}
+
+impl Framer {
+    pub fn new(dev_rate: u32, channels: usize) -> Self {
+        Framer { dev_rate, channels, pending: Vec::with_capacity(FRAME_SAMPLES * 2) }
+    }
+
+    /// Feed one callback's worth of interleaved f32 samples; returns any whole
+    /// 48 kHz mono frames that are now complete.
+    pub fn push(&mut self, interleaved: &[f32]) -> Vec<Vec<f32>> {
+        let mono = downmix(interleaved, self.channels);
+        let resampled = resample_linear(&mono, self.dev_rate, SAMPLE_RATE);
+        self.pending.extend_from_slice(&resampled);
+        let mut out = Vec::new();
+        while self.pending.len() >= FRAME_SAMPLES {
+            out.push(self.pending.drain(..FRAME_SAMPLES).collect());
+        }
+        out
+    }
+}
+
+// ---- Mixer (playback-side DSP, hardware independent) ------------------------
+
+/// Number of consecutive silent renders before a speaker is forgotten. This is
+/// deliberately generous so a source's AGC gain survives brief gaps between
+/// packets instead of resetting every time its buffer momentarily drains.
+const IDLE_LIMIT: u32 = 200;
+
+/// Per-speaker playback state: a jitter buffer plus its smoothed AGC gain.
+struct Source {
+    buf: VecDeque<f32>,
+    gain: f32,
+    idle: u32,
+}
+
+impl Source {
+    fn new() -> Self {
+        Source { buf: VecDeque::new(), gain: 1.0, idle: 0 }
+    }
+}
+
+/// Normalise a frame in place toward TARGET_RMS using a per-source smoothed gain.
+fn normalize_in_place(samples: &mut [f32], gain: &mut f32) {
+    if samples.is_empty() {
+        return;
+    }
+    let rms = (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt();
+    let desired = if rms < NOISE_GATE {
+        1.0 // don't amplify silence/noise up to full scale
+    } else {
+        (TARGET_RMS / rms).clamp(MIN_GAIN, MAX_GAIN)
+    };
+    *gain = *gain * (1.0 - GAIN_SMOOTH) + desired * GAIN_SMOOTH;
+    for s in samples.iter_mut() {
+        *s = (*s * *gain).clamp(-1.0, 1.0);
+    }
+}
+
+/// Equal-weight, per-source-normalised mixer targeting `rate` Hz.
+pub struct Mixer {
+    sources: HashMap<u64, Source>,
+    rate: u32,
+}
+
+impl Mixer {
+    pub fn new(rate: u32) -> Self {
+        Mixer { sources: HashMap::new(), rate }
+    }
+
+    /// Enqueue a 48 kHz mono frame from remote speaker `peer_id`.
+    pub fn push_frame(&mut self, peer_id: u64, pcm_48k_mono: &[f32]) {
+        let mut samples = resample_linear(pcm_48k_mono, SAMPLE_RATE, self.rate);
+        let src = self.sources.entry(peer_id).or_insert_with(Source::new);
+        normalize_in_place(&mut samples, &mut src.gain);
+        // Cap per-source latency: if we fell a second behind, resync.
+        if src.buf.len() > self.rate as usize {
+            src.buf.clear();
+        }
+        src.buf.extend(samples);
+    }
+
+    /// Number of speakers with audio still buffered.
+    #[allow(dead_code)]
+    pub fn active_sources(&self) -> usize {
+        self.sources.values().filter(|s| !s.buf.is_empty()).count()
+    }
+
+    /// Render into an interleaved output buffer with `channels` channels,
+    /// mixing active speakers with equal weight.
+    pub fn render(&mut self, out: &mut [f32], channels: usize) {
+        let channels = channels.max(1);
+        // Age each source: those with data this render stay fresh; the rest
+        // accumulate idle time toward eventual pruning (keeps AGC gain across
+        // brief inter-packet gaps).
+        for src in self.sources.values_mut() {
+            if src.buf.is_empty() {
+                src.idle = src.idle.saturating_add(1);
+            } else {
+                src.idle = 0;
+            }
+        }
+        for frame in out.chunks_mut(channels) {
+            let mut sum = 0.0f32;
+            let mut active = 0u32;
+            for src in self.sources.values_mut() {
+                if let Some(s) = src.buf.pop_front() {
+                    sum += s;
+                    active += 1;
+                }
+            }
+            let v = if active > 0 { sum / active as f32 } else { 0.0 };
+            for o in frame.iter_mut() {
+                *o = v;
+            }
+        }
+        // Forget speakers that have been silent for a long time.
+        self.sources.retain(|_, s| s.idle < IDLE_LIMIT);
+    }
+}
+
 // ---- device enumeration -----------------------------------------------------
+
+/// cpal 0.18 exposes the human-readable name via `Device::description()`.
+fn device_name(d: &Device) -> Option<String> {
+    d.description().ok().map(|desc| desc.name().to_string())
+}
 
 pub fn list_input_devices() -> Vec<String> {
     cpal::default_host()
         .input_devices()
-        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .map(|it| it.filter_map(|d| device_name(&d)).collect())
         .unwrap_or_default()
 }
 
 pub fn list_output_devices() -> Vec<String> {
     cpal::default_host()
         .output_devices()
-        .map(|it| it.filter_map(|d| d.name().ok()).collect())
+        .map(|it| it.filter_map(|d| device_name(&d)).collect())
         .unwrap_or_default()
 }
 
@@ -79,17 +215,16 @@ fn find_input_device(name: &str) -> Option<Device> {
     cpal::default_host()
         .input_devices()
         .ok()?
-        .find(|d| d.name().ok().as_deref() == Some(name))
+        .find(|d| device_name(d).as_deref() == Some(name))
 }
 
 fn find_output_device(name: &str) -> Option<Device> {
     cpal::default_host()
         .output_devices()
         .ok()?
-        .find(|d| d.name().ok().as_deref() == Some(name))
+        .find(|d| device_name(d).as_deref() == Some(name))
 }
 
-/// Resolve an optional device name to a concrete input device (None = default).
 fn resolve_input(name: &Option<String>) -> Result<Device, String> {
     match name {
         Some(n) => find_input_device(n).ok_or_else(|| format!("input device '{n}' not found")),
@@ -115,77 +250,93 @@ pub struct Capture {
     _stream: Stream,
 }
 
+/// Build an input stream for sample type `T`, converting each sample to f32.
+fn build_input_stream<T>(
+    device: &Device,
+    config: &StreamConfig,
+    mut framer: Framer,
+    frames_out: Sender<Vec<f32>>,
+) -> Result<Stream, String>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let err_fn = |e| eprintln!("input stream error: {e}");
+    device
+        .build_input_stream(
+            config.clone(),
+            move |data: &[T], _| {
+                let buf: Vec<f32> = data.iter().map(|s| f32::from_sample(*s)).collect();
+                for frame in framer.push(&buf) {
+                    let _ = frames_out.send(frame);
+                }
+            },
+            err_fn,
+            None,
+        )
+        .map_err(|e| format!("build input stream: {e}"))
+}
+
 impl Capture {
     pub fn start(device: &Device, frames_out: Sender<Vec<f32>>) -> Result<Self, String> {
         let default = device
             .default_input_config()
             .map_err(|e| format!("default input config: {e}"))?;
         let channels = default.channels() as usize;
-        let dev_rate = default.sample_rate().0;
+        let dev_rate = default.sample_rate();
+        let fmt = default.sample_format();
         let config: StreamConfig = default.config();
+        let framer = Framer::new(dev_rate, channels);
 
-        let err_fn = |e| eprintln!("input stream error: {e}");
-        let mut pending: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * 2);
-
-        let stream = device
-            .build_input_stream(
-                &config,
-                move |data: &[f32], _| {
-                    let mono = downmix(data, channels);
-                    let resampled = resample_linear(&mono, dev_rate, SAMPLE_RATE);
-                    pending.extend_from_slice(&resampled);
-                    while pending.len() >= FRAME_SAMPLES {
-                        let frame: Vec<f32> = pending.drain(..FRAME_SAMPLES).collect();
-                        let _ = frames_out.send(frame);
-                    }
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("build input stream: {e}"))?;
+        let stream = match fmt {
+            SampleFormat::F32 => build_input_stream::<f32>(device, &config, framer, frames_out)?,
+            SampleFormat::I16 => build_input_stream::<i16>(device, &config, framer, frames_out)?,
+            SampleFormat::U16 => build_input_stream::<u16>(device, &config, framer, frames_out)?,
+            other => return Err(format!("unsupported input sample format: {other:?}")),
+        };
         stream.play().map_err(|e| format!("play input: {e}"))?;
         Ok(Capture { _stream: stream })
     }
 }
 
-// ---- playback / mixing ------------------------------------------------------
+// ---- playback ---------------------------------------------------------------
 
-/// Per-speaker playback state: a jitter buffer plus its smoothed AGC gain.
-struct Source {
-    buf: VecDeque<f32>,
-    gain: f32,
-}
+type SharedMixer = Arc<Mutex<Mixer>>;
 
-impl Source {
-    fn new() -> Self {
-        Source { buf: VecDeque::new(), gain: 1.0 }
-    }
-}
-
-/// Normalise a frame in place toward TARGET_RMS using a per-source smoothed gain.
-fn normalize_in_place(samples: &mut [f32], gain: &mut f32) {
-    if samples.is_empty() {
-        return;
-    }
-    let rms = (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt();
-    let desired = if rms < NOISE_GATE {
-        1.0 // don't amplify silence/noise up to full scale
-    } else {
-        (TARGET_RMS / rms).clamp(MIN_GAIN, MAX_GAIN)
-    };
-    *gain = *gain * (1.0 - GAIN_SMOOTH) + desired * GAIN_SMOOTH;
-    for s in samples.iter_mut() {
-        *s = (*s * *gain).clamp(-1.0, 1.0);
-    }
-}
-
-type SourceMap = Arc<Mutex<HashMap<u64, Source>>>;
-
-/// Speaker playback with equal-weight mixing across active speakers.
+/// Speaker playback backed by a shared [`Mixer`].
 pub struct Playback {
     _stream: Stream,
-    sources: SourceMap,
+    mixer: SharedMixer,
     rate: u32,
+}
+
+/// Build an output stream for sample type `T`, converting f32 mix to `T`.
+fn build_output_stream<T>(
+    device: &Device,
+    config: &StreamConfig,
+    channels: usize,
+    mixer: SharedMixer,
+) -> Result<Stream, String>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let err_fn = |e| eprintln!("output stream error: {e}");
+    let mut scratch: Vec<f32> = Vec::new();
+    device
+        .build_output_stream(
+            config.clone(),
+            move |data: &mut [T], _| {
+                scratch.clear();
+                scratch.resize(data.len(), 0.0);
+                mixer.lock().unwrap().render(&mut scratch, channels);
+                for (o, s) in data.iter_mut().zip(scratch.iter()) {
+                    *o = T::from_sample(*s);
+                }
+            },
+            err_fn,
+            None,
+        )
+        .map_err(|e| format!("build output stream: {e}"))
 }
 
 impl Playback {
@@ -194,62 +345,30 @@ impl Playback {
             .default_output_config()
             .map_err(|e| format!("default output config: {e}"))?;
         let channels = default.channels() as usize;
-        let rate = default.sample_rate().0;
+        let rate = default.sample_rate();
+        let fmt = default.sample_format();
         let config: StreamConfig = default.config();
 
-        let sources: SourceMap = Arc::new(Mutex::new(HashMap::new()));
-        let sources_cb = sources.clone();
-        let err_fn = |e| eprintln!("output stream error: {e}");
+        let mixer: SharedMixer = Arc::new(Mutex::new(Mixer::new(rate)));
 
-        let stream = device
-            .build_output_stream(
-                &config,
-                move |data: &mut [f32], _| {
-                    let mut map = sources_cb.lock().unwrap();
-                    for frame in data.chunks_mut(channels) {
-                        // Equal-weight mix: sum one sample from each active
-                        // speaker, then divide by the number that were active.
-                        let mut sum = 0.0f32;
-                        let mut active = 0u32;
-                        for src in map.values_mut() {
-                            if let Some(s) = src.buf.pop_front() {
-                                sum += s;
-                                active += 1;
-                            }
-                        }
-                        let v = if active > 0 { sum / active as f32 } else { 0.0 };
-                        for out in frame.iter_mut() {
-                            *out = v;
-                        }
-                    }
-                    // Drop drained speakers so the map doesn't grow forever.
-                    map.retain(|_, s| !s.buf.is_empty());
-                },
-                err_fn,
-                None,
-            )
-            .map_err(|e| format!("build output stream: {e}"))?;
+        let stream = match fmt {
+            SampleFormat::F32 => build_output_stream::<f32>(device, &config, channels, mixer.clone())?,
+            SampleFormat::I16 => build_output_stream::<i16>(device, &config, channels, mixer.clone())?,
+            SampleFormat::U16 => build_output_stream::<u16>(device, &config, channels, mixer.clone())?,
+            other => return Err(format!("unsupported output sample format: {other:?}")),
+        };
         stream.play().map_err(|e| format!("play output: {e}"))?;
 
-        Ok(Playback { _stream: stream, sources, rate })
+        Ok(Playback { _stream: stream, mixer, rate })
     }
 
     pub fn rate(&self) -> u32 {
         self.rate
     }
 
-    /// Enqueue a 48 kHz mono frame from remote speaker `peer_id`. The source is
-    /// loudness-normalised, then it participates in equal-weight mixing.
-    pub fn push_frame(&self, peer_id: u64, pcm_48k_mono: &[f32], dev_rate: u32) {
-        let mut samples = resample_linear(pcm_48k_mono, SAMPLE_RATE, dev_rate);
-        let mut map = self.sources.lock().unwrap();
-        let src = map.entry(peer_id).or_insert_with(Source::new);
-        normalize_in_place(&mut samples, &mut src.gain);
-        // Cap per-source latency: if we fell a second behind, resync.
-        if src.buf.len() > dev_rate as usize {
-            src.buf.clear();
-        }
-        src.buf.extend(samples);
+    /// Enqueue a 48 kHz mono frame from remote speaker `peer_id`.
+    pub fn push_frame(&self, peer_id: u64, pcm_48k_mono: &[f32]) {
+        self.mixer.lock().unwrap().push_frame(peer_id, pcm_48k_mono);
     }
 }
 
