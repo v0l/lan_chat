@@ -615,12 +615,12 @@ impl ChatApp {
         });
         ui.add_space(10.0);
 
+        let stick = self.scroll_to_bottom;
         Container::new().padding(4).show(ui, |ui| {
-            let mut scroll = egui::ScrollArea::vertical().auto_shrink([false; 2]);
-            if self.scroll_to_bottom {
-                scroll = scroll.stick_to_bottom(true);
-            }
-            scroll.show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .stick_to_bottom(stick)
+                .show(ui, |ui| {
                 ui.add_space(4.0);
                 if self.log.is_empty() {
                     ui.vertical_centered(|ui| {
@@ -652,6 +652,12 @@ impl ChatApp {
                         ui.label(egui::RichText::new(&line.body).color(theme::TEXT));
                     });
                     ui.add_space(2.0);
+                }
+                // Explicitly pin to the newest content this frame. This works
+                // even on the first frames, before the scroll area has any
+                // persisted state for stick_to_bottom to act on.
+                if stick {
+                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                 }
             });
             self.scroll_to_bottom = false;
