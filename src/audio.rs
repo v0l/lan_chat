@@ -195,6 +195,17 @@ impl Mixer {
         self.sfx.extend(samples.iter().copied());
     }
 
+    /// Synthesise and queue a notification cue at the current rate.
+    pub fn play_cue(&mut self, cue: Cue) {
+        let s = synth_cue(cue, self.rate);
+        self.push_sfx(&s);
+    }
+
+    /// Update the output rate (used when the output device changes).
+    pub fn set_rate(&mut self, rate: u32) {
+        self.rate = rate;
+    }
+
     /// Enqueue a 48 kHz mono frame from remote speaker `peer_id`.
     pub fn push_frame(&mut self, peer_id: u64, pcm_48k_mono: &[f32]) {
         let mut samples = resample_linear(pcm_48k_mono, SAMPLE_RATE, self.rate);
@@ -385,12 +396,13 @@ impl Capture {
 
 // ---- playback ---------------------------------------------------------------
 
-type SharedMixer = Arc<Mutex<Mixer>>;
+pub type SharedMixer = Arc<Mutex<Mixer>>;
 
-/// Speaker playback backed by a shared [`Mixer`].
+/// Speaker playback backed by a shared [`Mixer`]. The mixer is owned/shared
+/// elsewhere (the receive thread pushes to it); the output stream holds its own
+/// clone, so `Playback` only needs the stream handle and rate.
 pub struct Playback {
     _stream: Stream,
-    mixer: SharedMixer,
     rate: u32,
 }
 
@@ -446,7 +458,9 @@ where
 }
 
 impl Playback {
-    pub fn start(device: &Device) -> Result<Self, String> {
+    /// Build an output stream feeding from the shared `mixer` (which is reused
+    /// across device switches so the receive pipeline never loses its buffer).
+    pub fn start(device: &Device, mixer: SharedMixer) -> Result<Self, String> {
         let default = device
             .default_output_config()
             .map_err(|e| format!("default output config: {e}"))?;
@@ -455,7 +469,7 @@ impl Playback {
         let fmt = default.sample_format();
         let config: StreamConfig = default.config();
 
-        let mixer: SharedMixer = Arc::new(Mutex::new(Mixer::new(rate)));
+        mixer.lock().unwrap().set_rate(rate);
 
         macro_rules! build_out {
             ($($v:ident => $t:ty),+ $(,)?) => {
@@ -478,23 +492,13 @@ impl Playback {
             "playback: device={:?} rate={rate}Hz channels={channels} fmt={fmt:?}",
             device_name(device).unwrap_or_else(|| "<unknown>".into())
         );
-        Ok(Playback { _stream: stream, mixer, rate })
+        Ok(Playback { _stream: stream, rate })
     }
 
     pub fn rate(&self) -> u32 {
         self.rate
     }
 
-    /// Enqueue a 48 kHz mono frame from remote speaker `peer_id`.
-    pub fn push_frame(&self, peer_id: u64, pcm_48k_mono: &[f32]) {
-        self.mixer.lock().unwrap().push_frame(peer_id, pcm_48k_mono);
-    }
-
-    /// Play a short UI notification cue.
-    pub fn play_cue(&self, cue: Cue) {
-        let samples = synth_cue(cue, self.rate);
-        self.mixer.lock().unwrap().push_sfx(&samples);
-    }
 }
 
 // ---- high-level handle ------------------------------------------------------
@@ -504,29 +508,42 @@ pub struct Voice {
     capture: Option<Capture>,
     pub playback: Playback,
     pub out_rate: u32,
+    mixer: SharedMixer,
     input_name: Option<String>,  // None = system default
     output_name: Option<String>, // None = system default
     mic_on: bool,
-    pub frames_rx: Receiver<Vec<f32>>,
+    frames_rx: Option<Receiver<Vec<f32>>>,
     frames_tx: Sender<Vec<f32>>,
 }
 
 impl Voice {
     pub fn new() -> Result<Self, String> {
         let device = resolve_output(&None)?;
-        let playback = Playback::start(&device)?;
+        let mixer: SharedMixer = Arc::new(Mutex::new(Mixer::new(SAMPLE_RATE)));
+        let playback = Playback::start(&device, mixer.clone())?;
         let out_rate = playback.rate();
         let (frames_tx, frames_rx) = crossbeam_channel::unbounded();
         Ok(Voice {
             capture: None,
             playback,
             out_rate,
+            mixer,
             input_name: None,
             output_name: None,
             mic_on: false,
-            frames_rx,
+            frames_rx: Some(frames_rx),
             frames_tx,
         })
+    }
+
+    /// Shared mixer handle (for the receive thread to push voice + cues).
+    pub fn mixer(&self) -> SharedMixer {
+        self.mixer.clone()
+    }
+
+    /// Take ownership of the mic-frame receiver (for the send thread).
+    pub fn take_frames_rx(&mut self) -> Option<Receiver<Vec<f32>>> {
+        self.frames_rx.take()
     }
 
     pub fn input_name(&self) -> &Option<String> {
@@ -554,9 +571,10 @@ impl Voice {
     }
 
     /// Select the output (speaker) device. `None` means system default.
+    /// Reuses the shared mixer so buffered/receive state survives the switch.
     pub fn set_output(&mut self, name: Option<String>) -> Result<(), String> {
         let device = resolve_output(&name)?;
-        let playback = Playback::start(&device)?;
+        let playback = Playback::start(&device, self.mixer.clone())?;
         self.out_rate = playback.rate();
         self.playback = playback;
         self.output_name = name;

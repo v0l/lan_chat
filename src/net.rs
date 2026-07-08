@@ -1,11 +1,14 @@
 //! IPv6-only multicast transport.
 //!
-//! All peers bind the same UDP port, join the same IPv6 multicast group, and
-//! exchange [`Envelope`] datagrams. No servers, no IPv4.
+//! All peers bind the same UDP port and join the same IPv6 multicast group. By
+//! default the group is joined (and sent) on **every** IPv6-capable interface,
+//! so multi-adapter hosts (Windows boxes with WSL/Hyper-V/VPN `vEthernet`
+//! adapters, etc.) work without having to hand-pick an interface. Pass an
+//! explicit interface index to override.
 
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -13,20 +16,48 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::protocol::Envelope;
 
-/// Default link-local ("ff02") transient multicast group used by this app.
+/// Default link-local ("ff12") transient multicast group used by this app.
 pub const DEFAULT_GROUP: Ipv6Addr = Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x4c41, 0x4e43);
 pub const DEFAULT_PORT: u16 = 45654;
+
+/// Enumerate IPv6-capable, non-loopback interfaces as `(index, name)`.
+pub fn multicast_interfaces() -> Vec<(u32, String)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for ifa in ifaces {
+            if ifa.is_loopback() {
+                continue;
+            }
+            // Only interfaces that actually have an IPv6 address can carry the
+            // group; that also filters out down/unconfigured adapters.
+            if !matches!(ifa.addr, if_addrs::IfAddr::V6(_)) {
+                continue;
+            }
+            if let Some(idx) = ifa.index {
+                if idx != 0 && seen.insert(idx) {
+                    out.push((idx, ifa.name.clone()));
+                }
+            }
+        }
+    }
+    out
+}
 
 pub struct Net {
     socket: Arc<Socket>,
     group: SocketAddrV6,
+    /// Interfaces we send the group out of.
+    send_ifaces: Vec<u32>,
+    /// Serialises sends (each send mutates the socket's multicast interface).
+    send_guard: Mutex<()>,
     /// Incoming decoded envelopes together with the sender's socket address.
     pub incoming: Receiver<(Envelope, SocketAddr)>,
 }
 
 impl Net {
-    /// Join `group`%`iface_index` on `port`. `iface_index` 0 means "let the OS
-    /// pick the default interface".
+    /// Join `group` on `port`. `iface_index` 0 means "join on every IPv6
+    /// interface"; a non-zero value pins a single interface.
     pub fn join(group: Ipv6Addr, port: u16, iface_index: u32) -> io::Result<Self> {
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_only_v6(true)?;
@@ -37,31 +68,75 @@ impl Net {
         // Bind to the wildcard address so we receive multicast traffic.
         let bind_addr: SocketAddr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
         socket.bind(&bind_addr.into())?;
-
-        // Join the multicast group and enable loopback so multiple instances
-        // on one host (and our own keepalives) work during testing.
-        socket.join_multicast_v6(&group, iface_index)?;
         socket.set_multicast_loop_v6(true)?;
         socket.set_multicast_hops_v6(4)?;
-        if iface_index != 0 {
-            socket.set_multicast_if_v6(iface_index)?;
+
+        // Which interfaces to join / send on.
+        let targets: Vec<(u32, String)> = if iface_index != 0 {
+            vec![(iface_index, format!("index {iface_index}"))]
+        } else {
+            multicast_interfaces()
+        };
+
+        let mut send_ifaces = Vec::new();
+        for (idx, name) in &targets {
+            match socket.join_multicast_v6(&group, *idx) {
+                Ok(()) => {
+                    log::info!("joined [{group}] on interface {idx} ({name})");
+                    send_ifaces.push(*idx);
+                }
+                Err(e) => log::warn!("join [{group}] on interface {idx} ({name}) failed: {e}"),
+            }
+        }
+        // Fallback: let the OS pick if we couldn't join anything specific.
+        if send_ifaces.is_empty() {
+            socket.join_multicast_v6(&group, 0)?;
+            log::info!("joined [{group}] on default interface");
+            send_ifaces.push(0);
         }
 
         let socket = Arc::new(socket);
-        let group_addr = SocketAddrV6::new(group, port, 0, iface_index);
+        let group_addr = SocketAddrV6::new(group, port, 0, 0);
 
         let (tx, rx) = crossbeam_channel::unbounded();
         spawn_reader(socket.clone(), tx);
 
-        Ok(Net { socket, group: group_addr, incoming: rx })
+        Ok(Net {
+            socket,
+            group: group_addr,
+            send_ifaces,
+            send_guard: Mutex::new(()),
+            incoming: rx,
+        })
     }
 
-    /// Send one envelope to the multicast group.
+    /// Send one envelope to the group on every joined interface. Thread-safe.
     pub fn send(&self, env: &Envelope) -> io::Result<()> {
         let bytes = env.encode();
-        let dst: SocketAddr = self.group.into();
-        self.socket.send_to(&bytes, &dst.into())?;
-        Ok(())
+        let group_ip = *self.group.ip();
+        let port = self.group.port();
+        // Link-local/interface-local scope needs the outgoing interface encoded
+        // in the destination scope id; wider scopes don't.
+        let scope = group_ip.segments()[0] & 0x000f;
+        let link_scoped = scope <= 2;
+
+        let _guard = self.send_guard.lock().unwrap();
+        let mut any = false;
+        let mut last_err = None;
+        for &idx in &self.send_ifaces {
+            let _ = self.socket.set_multicast_if_v6(idx);
+            let scope_id = if link_scoped { idx } else { 0 };
+            let dst: SocketAddr = SocketAddrV6::new(group_ip, port, 0, scope_id).into();
+            match self.socket.send_to(&bytes, &dst.into()) {
+                Ok(_) => any = true,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if any {
+            Ok(())
+        } else {
+            Err(last_err.unwrap_or_else(|| io::Error::other("no interfaces to send on")))
+        }
     }
 
     pub fn group(&self) -> SocketAddrV6 {
@@ -73,7 +148,6 @@ fn spawn_reader(socket: Arc<Socket>, tx: Sender<(Envelope, SocketAddr)>) {
     thread::Builder::new()
         .name("net-reader".into())
         .spawn(move || {
-            // Uninitialised receive buffer, as required by socket2's recv_from.
             let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 65535];
             loop {
                 match socket.recv_from(&mut buf) {
@@ -92,7 +166,6 @@ fn spawn_reader(socket: Arc<Socket>, tx: Sender<(Envelope, SocketAddr)>) {
                         }
                     }
                     Err(e) => {
-                        // Transient errors: keep going; fatal: stop.
                         if e.kind() == io::ErrorKind::Interrupted {
                             continue;
                         }

@@ -42,11 +42,15 @@ stack. Override with `RUST_LOG`, e.g. `RUST_LOG=lan_chat=debug cargo run`.
 | Module          | Responsibility                                        |
 |-----------------|-------------------------------------------------------|
 | `protocol.rs`   | Wire format (`Envelope` + `Payload`), postcard-encoded |
-| `net.rs`        | IPv6 multicast socket (join, send, background reader)   |
+| `net.rs`        | IPv6 multicast socket: multi-interface join, thread-safe send, reader |
 | `audio.rs`      | cpal capture/playback, resampling, AGC + equal-weight mix, cues |
 | `theme.rs`      | Visual tokens, reusable `Container` card, VU meter      |
-| `app.rs`        | egui UI, event pumping, presence/keepalive              |
+| `app.rs`        | egui UI + background engine/keepalive/mic threads       |
 | `main.rs`       | CLI args, logging, window/icon bootstrap                |
+
+Real-time work (receive/mix/presence, mic send, keepalives) runs on **dedicated
+threads**, so audio and presence keep flowing even when the window is hidden
+(e.g. on another workspace) and the egui update loop is paused.
 
 Sender identity is a random per-process `peer_id`; looped-back multicast from
 your own process is filtered out by that id.
@@ -119,8 +123,10 @@ network is dropping multicast — work through the list below.
   New-NetFirewallRule -DisplayName "LAN Chat" -Direction Inbound `
     -Protocol UDP -LocalPort 45654 -Action Allow -Profile Any
   ```
-- **Wrong interface.** On multi-homed machines the OS may pick the wrong NIC.
-  Pass `--iface INDEX` explicitly (`ip link` / `netsh interface ipv6 show interfaces`).
+- **Wrong interface.** By default the app joins/sends on **every** IPv6-capable
+  interface, so multi-adapter machines (Windows boxes with WSL/Hyper-V/VPN
+  `vEthernet` adapters, etc.) work automatically. To pin a single interface,
+  pass `--iface INDEX` (`ip link` / `netsh interface ipv6 show interfaces`).
 - **WiFi client / AP isolation.** Disable it — it blocks device-to-device traffic.
 - **MLD snooping without a querier.** This is *MLD* (IPv6), not IGMP (IPv4) — the
   IPv4 setting has no effect here. A snooping bridge with **no querier** prunes
