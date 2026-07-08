@@ -130,9 +130,50 @@ jobs:
           path: dist/lan_chat-macos-universal.dmg
           if-no-files-found: error
 
+  android:
+    name: android-apk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Ensure SDK platform + build-tools
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" "build-tools;34.0.0" >/dev/null
+
+      - name: Install cargo-apk
+        run: cargo install cargo-apk
+
+      - name: Build APK (arm64, debug-signed)
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: cargo apk build --target aarch64-linux-android
+
+      - name: Stage APK
+        run: |
+          mkdir -p dist
+          cp target/debug/apk/lan_chat.apk dist/lan_chat-android-arm64.apk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lan_chat-android-arm64.apk
+          path: dist/lan_chat-android-arm64.apk
+          if-no-files-found: error
+
   release:
     name: Attach binaries to release
-    needs: [build, macos]
+    needs: [build, macos, android]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

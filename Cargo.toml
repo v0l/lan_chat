@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "LAN IPv6-only multicast chat and voice app with a GUI"
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
-eframe = "0.35"
+# Default features minus `accesskit` (incompatible with android native-activity).
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "wgpu"] }
 egui = "0.35"
 socket2 = { version = "0.6", features = ["all"] }
 cpal = "0.18"
@@ -20,6 +24,41 @@ if-addrs = "0.15.0"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.35", default-features = false, features = ["wayland", "x11"] }
+
+# Android: entry point, logging, and JNI for the Wi-Fi MulticastLock.
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.35", default-features = false, features = ["android-native-activity"] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.14"
+jni = "0.21"
+ndk-context = "0.1"
+
+[package.metadata.android]
+package = "network.harkin.lanchat"
+apk_name = "lan_chat"
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
+
+[package.metadata.android.sdk]
+# 26 (Android 8.0): required by cpal's AAudio backend (libaaudio).
+min_sdk_version = 26
+target_sdk_version = 34
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
+[package.metadata.android.application]
+label = "LAN Chat"
 
 [profile.release]
 opt-level = 3

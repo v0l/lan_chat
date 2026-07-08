@@ -10,17 +10,11 @@
 //! Every instance on the same link that joins the same group/port sees each
 //! other. No server. IPv6 only.
 
-mod app;
-mod audio;
-mod net;
-mod protocol;
-mod theme;
-
 use std::net::Ipv6Addr;
 use std::str::FromStr;
 
-use app::ChatApp;
-use net::{Net, DEFAULT_GROUP, DEFAULT_PORT};
+use lan_chat::audio;
+use lan_chat::net::{Net, DEFAULT_GROUP, DEFAULT_PORT};
 
 struct Args {
     name: String,
@@ -103,23 +97,5 @@ fn main() -> eframe::Result<()> {
     log::info!("output devices: {:?}", audio::list_output_devices());
     log::info!("input devices: {:?}", audio::list_input_devices());
 
-    let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([760.0, 520.0])
-        .with_title("LAN Chat · IPv6");
-    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
-        Ok(icon) => viewport = viewport.with_icon(icon),
-        Err(e) => log::warn!("failed to load window icon: {e}"),
-    }
-
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
-
-    let name = args.name.clone();
-    eframe::run_native(
-        "lan_chat",
-        options,
-        Box::new(move |cc| {
-            theme::apply(&cc.egui_ctx);
-            Ok(Box::new(ChatApp::new(peer_id, name, net)))
-        }),
-    )
+    lan_chat::launch(args.name, net, peer_id, lan_chat::desktop_options())
 }

@@ -32,6 +32,29 @@ link — no server, no discovery service, **IPv6 only**.
   `assets/icon.ico` is embedded into the `.exe` via `build.rs` + `winresource`
   so Explorer/Alt-Tab show it too.
 
+## Android
+
+Builds as an APK via [`cargo-apk`](https://crates.io/crates/cargo-apk):
+
+```sh
+rustup target add aarch64-linux-android
+cargo install cargo-apk
+export ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/<version>
+cargo apk build --target aarch64-linux-android      # debug, auto-signed, installable
+```
+
+The entry point is `android_main` in `src/lib.rs`. Notes:
+
+- **min SDK 26** (Android 8.0) — required by cpal's AAudio voice backend.
+- Acquires a Wi-Fi **`MulticastLock`** via JNI at startup — Android silently
+  drops inbound multicast without it.
+- Manifest permissions (`INTERNET`, `ACCESS_/CHANGE_WIFI_*`,
+  `CHANGE_WIFI_MULTICAST_STATE`, `RECORD_AUDIO`) come from
+  `[package.metadata.android]` in `Cargo.toml`.
+- CI publishes `lan_chat-android-arm64.apk` (debug-signed; sideload with
+  “install unknown apps” enabled). A release-signed, size-optimised APK needs a
+  keystore — a follow-up.
+
 ## Logging
 
 Uses `env_logger`. Defaults to `info` for the app and `warn` for the noisy GUI
