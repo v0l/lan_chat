@@ -1,3 +1,7 @@
+// On Windows release builds, don't spawn a console window (this is a GUI app).
+// Debug builds keep the console so logs are visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! LAN Chat — IPv6-only multicast chat & voice with a GUI.
 //!
 //! Usage:
@@ -99,12 +103,15 @@ fn main() -> eframe::Result<()> {
     log::info!("output devices: {:?}", audio::list_output_devices());
     log::info!("input devices: {:?}", audio::list_input_devices());
 
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 520.0])
-            .with_title("LAN Chat · IPv6"),
-        ..Default::default()
-    };
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([760.0, 520.0])
+        .with_title("LAN Chat · IPv6");
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(e) => log::warn!("failed to load window icon: {e}"),
+    }
+
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
 
     let name = args.name.clone();
     eframe::run_native(

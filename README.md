@@ -21,6 +21,14 @@ link — no server, no discovery service, **IPv6 only**.
   cards, a single signal-teal accent reserved for live state) built on a
   reusable `Container` card widget and a token system in `src/theme.rs`.
 
+## Windows
+
+- Release builds use the `windows` subsystem, so **no console window** appears
+  (debug builds keep the console for logs).
+- The app icon (`assets/icon.png`) is used for the window/taskbar, and
+  `assets/icon.ico` is embedded into the `.exe` via `build.rs` + `winresource`
+  so Explorer/Alt-Tab show it too.
+
 ## Logging
 
 Uses `env_logger`. Defaults to `info` for the app and `warn` for the noisy GUI
