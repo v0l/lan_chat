@@ -1,0 +1,19 @@
+[package]
+name = "lan_chat"
+version = "0.1.0"
+edition = "2021"
+description = "LAN IPv6-only multicast chat and voice app with a GUI"
+
+[dependencies]
+eframe = "0.28"
+egui = "0.28"
+socket2 = { version = "0.5", features = ["all"] }
+cpal = "0.15"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+crossbeam-channel = "0.5"
+gethostname = "0.5"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
