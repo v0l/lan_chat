@@ -208,7 +208,11 @@ fn render_upmixes_mono_to_multichannel() {
     let frame = &frame[..FRAME_SAMPLES.min(frame.len())];
 
     let mut mixer = Mixer::new(rate);
-    mixer.push_frame(1, frame);
+    // Push enough frames to clear the jitter buffer's prefill threshold so the
+    // source is actually playing.
+    for _ in 0..8 {
+        mixer.push_frame(1, frame);
+    }
 
     let mut out = vec![0.0f32; FRAME_SAMPLES * 2]; // stereo interleaved
     mixer.render(&mut out, 2);

@@ -98,16 +98,30 @@ impl Framer {
 /// packets instead of resetting every time its buffer momentarily drains.
 const IDLE_LIMIT: u32 = 200;
 
+/// Jitter-buffer target latency, in milliseconds. A speaker's buffer is
+/// prefilled to this depth before it starts playing, and is continuously
+/// trimmed back toward it, so brief network/callback jitter never drains it and
+/// slow clock drift never lets it grow without bound.
+const TARGET_LATENCY_MS: u32 = 60;
+/// Hard upper bound before we drop the oldest audio. Kept close to the target
+/// so a mismatched output clock can't accumulate seconds of delay (which used
+/// to trigger a full buffer wipe and a long, audible dropout).
+const MAX_LATENCY_MS: u32 = 200;
+
 /// Per-speaker playback state: a jitter buffer plus its smoothed AGC gain.
 struct Source {
     buf: VecDeque<f32>,
     gain: f32,
     idle: u32,
+    /// False until the buffer has prefilled to the target depth. While false the
+    /// source renders silence, so playback starts (and restarts after an
+    /// underrun) smoothly instead of stuttering one sample at a time.
+    playing: bool,
 }
 
 impl Source {
     fn new() -> Self {
-        Source { buf: VecDeque::new(), gain: 1.0, idle: 0 }
+        Source { buf: VecDeque::new(), gain: 1.0, idle: 0, playing: false }
     }
 }
 
@@ -209,13 +223,21 @@ impl Mixer {
     /// Enqueue a 48 kHz mono frame from remote speaker `peer_id`.
     pub fn push_frame(&mut self, peer_id: u64, pcm_48k_mono: &[f32]) {
         let mut samples = resample_linear(pcm_48k_mono, SAMPLE_RATE, self.rate);
+        let rate = self.rate;
         let src = self.sources.entry(peer_id).or_insert_with(Source::new);
         normalize_in_place(&mut samples, &mut src.gain);
-        // Cap per-source latency: if we fell a second behind, resync.
-        if src.buf.len() > self.rate as usize {
-            src.buf.clear();
-        }
         src.buf.extend(samples);
+        // Cap per-source latency. A nominal-48 kHz output device rarely runs at
+        // *exactly* the sender's rate, so without this the buffer drifts upward
+        // for one drift direction. Instead of wiping it (a long dropout), drop
+        // just the oldest samples back to the target depth: latency stays low
+        // and steady and playback keeps flowing.
+        let max_latency = (rate as usize * MAX_LATENCY_MS as usize) / 1000;
+        let target_latency = (rate as usize * TARGET_LATENCY_MS as usize) / 1000;
+        if src.buf.len() > max_latency {
+            let drop = src.buf.len() - target_latency;
+            src.buf.drain(..drop);
+        }
     }
 
     /// Number of speakers with audio still buffered.
@@ -238,13 +260,27 @@ impl Mixer {
                 src.idle = 0;
             }
         }
+        let prefill = (self.rate as usize * TARGET_LATENCY_MS as usize) / 1000;
         for frame in out.chunks_mut(channels) {
             let mut sum = 0.0f32;
             let mut active = 0u32;
             for src in self.sources.values_mut() {
+                // Prefill to the target depth before playing, and re-arm the
+                // prefill after a full underrun, so jitter yields a brief clean
+                // gap rather than one-sample-at-a-time stutter.
+                if !src.playing {
+                    if src.buf.len() >= prefill {
+                        src.playing = true;
+                    } else {
+                        continue;
+                    }
+                }
                 if let Some(s) = src.buf.pop_front() {
                     sum += s;
                     active += 1;
+                    if src.buf.is_empty() {
+                        src.playing = false;
+                    }
                 }
             }
             let voice = if active > 0 { sum / active as f32 } else { 0.0 };
