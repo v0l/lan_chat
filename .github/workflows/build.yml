@@ -158,29 +158,20 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install SDK platform, build-tools + pinned NDK
+        # cargo-apk (ndk-build) only accepts SDK platforms within the NDK's
+        # own [min,max] platform range. Pinned NDK r25c caps at API 33, while
+        # the runner ships only android-34/35/36 (all above the cap) -> the
+        # platform list comes back empty and cargo-apk bails with the
+        # misleading 'Android SDK has no platforms installed'. Install
+        # android-30 (well within range; also cargo-apk's default target).
         run: |
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}"
-          # Fail loudly here (not deep inside cargo-apk) if the platform is missing.
-          test -d "$ANDROID_HOME/platforms/android-34" \
-            || { echo "::error::android-34 platform not installed under $ANDROID_HOME"; ls -la "$ANDROID_HOME/platforms" || true; exit 1; }
+          sdkmanager "platforms;android-30" "build-tools;34.0.0" "ndk;${NDK_VERSION}"
+          # Fail loudly here (not deep inside cargo-apk) if a prereq is missing.
+          test -d "$ANDROID_HOME/platforms/android-30" \
+            || { echo "::error::android-30 platform not installed under $ANDROID_HOME"; ls -la "$ANDROID_HOME/platforms" || true; exit 1; }
           test -d "$ANDROID_HOME/ndk/${NDK_VERSION}" \
             || { echo "::error::NDK ${NDK_VERSION} not installed under $ANDROID_HOME/ndk"; ls -la "$ANDROID_HOME/ndk" || true; exit 1; }
-
-      - name: Drop platforms cargo-apk can't parse (e.g. android-36.1)
-        # cargo-apk 0.10.0 fails enumerating the SDK if any platform dir isn't
-        # 'android-<integer>' (runners now ship decimal previews like
-        # android-36.1), reporting the misleading 'no platforms installed'.
-        run: |
-          for d in "$ANDROID_HOME"/platforms/*/; do
-            name=$(basename "$d")
-            ver=${name#android-}
-            if ! [[ "$ver" =~ ^[0-9]+$ ]]; then
-              echo "Removing unparseable platform: $name"
-              rm -rf "$d"
-            fi
-          done
-          echo "Remaining platforms:"; ls "$ANDROID_HOME/platforms"
 
       - name: Install cargo-apk
         run: cargo install cargo-apk --locked

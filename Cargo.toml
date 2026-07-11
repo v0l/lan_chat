@@ -44,7 +44,9 @@ build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
 [package.metadata.android.sdk]
 # 26 (Android 8.0): required by cpal's AAudio backend (libaaudio).
 min_sdk_version = 26
-target_sdk_version = 34
+# Kept within the pinned CI NDK's (r25c) max platform level so cargo-apk can
+# find a usable SDK platform; 30 is also cargo-apk's own default target.
+target_sdk_version = 30
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
