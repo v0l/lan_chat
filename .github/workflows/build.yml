@@ -133,31 +133,40 @@ jobs:
   android:
     name: android-apk
     runs-on: ubuntu-latest
+    env:
+      # Pin a known-good NDK. The runner's default (ANDROID_NDK_LATEST_HOME) is
+      # NDK r27+, which breaks cargo-apk builds; r25c is the last release that
+      # links cleanly with cargo-apk + rustc for this project.
+      NDK_VERSION: 25.2.9519653
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          # Both ABIs listed in Cargo.toml's build_targets, so the build can't
+          # fail on a missing rustup target regardless of cargo-apk's --target
+          # precedence.
+          targets: aarch64-linux-android, armv7-linux-androideabi
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: android
 
-      - name: Ensure SDK platform + build-tools
+      - name: Ensure SDK platform, build-tools + pinned NDK
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platforms;android-34" "build-tools;34.0.0" >/dev/null
+            "platforms;android-34" "build-tools;34.0.0" "ndk;${NDK_VERSION}" >/dev/null
 
       - name: Install cargo-apk
-        run: cargo install cargo-apk
+        run: cargo install cargo-apk --locked
 
       - name: Build APK (arm64, debug-signed)
-        env:
-          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: cargo apk build --target aarch64-linux-android
+        run: |
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          cargo apk build --target aarch64-linux-android
 
       - name: Stage APK
         run: |
