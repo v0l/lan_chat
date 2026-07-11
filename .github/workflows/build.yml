@@ -167,6 +167,21 @@ jobs:
           test -d "$ANDROID_HOME/ndk/${NDK_VERSION}" \
             || { echo "::error::NDK ${NDK_VERSION} not installed under $ANDROID_HOME/ndk"; ls -la "$ANDROID_HOME/ndk" || true; exit 1; }
 
+      - name: Drop platforms cargo-apk can't parse (e.g. android-36.1)
+        # cargo-apk 0.10.0 fails enumerating the SDK if any platform dir isn't
+        # 'android-<integer>' (runners now ship decimal previews like
+        # android-36.1), reporting the misleading 'no platforms installed'.
+        run: |
+          for d in "$ANDROID_HOME"/platforms/*/; do
+            name=$(basename "$d")
+            ver=${name#android-}
+            if ! [[ "$ver" =~ ^[0-9]+$ ]]; then
+              echo "Removing unparseable platform: $name"
+              rm -rf "$d"
+            fi
+          done
+          echo "Remaining platforms:"; ls "$ANDROID_HOME/platforms"
+
       - name: Install cargo-apk
         run: cargo install cargo-apk --locked
 
