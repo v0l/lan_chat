@@ -558,6 +558,9 @@ impl ChatApp {
                         theme::vu_meter(ui, mic_level);
                     }
 
+                    // Android (AAudio) doesn't enumerate devices, and rebuilding
+                    // the stream can fail; the OS handles routing. Hide the pickers.
+                    if !cfg!(target_os = "android") {
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("Input").font(theme::label_font()).color(theme::MUTED));
                     let cur_in = v.input_name().clone().unwrap_or_else(|| "Default".into());
@@ -599,6 +602,7 @@ impl ChatApp {
                     {
                         refresh = true;
                     }
+                    } // end !android device pickers
                 }
                 None => {
                     ui.label(egui::RichText::new("No audio device — chat still works.").color(theme::MUTED));

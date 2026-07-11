@@ -47,8 +47,9 @@ pub fn multicast_interfaces() -> Vec<(u32, String)> {
 pub struct Net {
     socket: Arc<Socket>,
     group: SocketAddrV6,
-    /// Interfaces we send the group out of.
-    send_ifaces: Vec<u32>,
+    /// Interfaces we've joined / send the group out of. Grows over time as new
+    /// interfaces (e.g. Wi-Fi coming up after launch) are discovered.
+    send_ifaces: Arc<Mutex<Vec<u32>>>,
     /// Serialises sends (each send mutates the socket's multicast interface).
     send_guard: Mutex<()>,
     /// Incoming decoded envelopes together with the sender's socket address.
@@ -97,9 +98,16 @@ impl Net {
 
         let socket = Arc::new(socket);
         let group_addr = SocketAddrV6::new(group, port, 0, 0);
+        let send_ifaces = Arc::new(Mutex::new(send_ifaces));
 
         let (tx, rx) = crossbeam_channel::unbounded();
         spawn_reader(socket.clone(), tx);
+
+        // In auto mode, keep re-scanning: interfaces (Wi-Fi, VPN, tethering)
+        // frequently appear *after* launch, especially on mobile.
+        if iface_index == 0 {
+            spawn_iface_monitor(socket.clone(), group, send_ifaces.clone());
+        }
 
         Ok(Net {
             socket,
@@ -120,10 +128,11 @@ impl Net {
         let scope = group_ip.segments()[0] & 0x000f;
         let link_scoped = scope <= 2;
 
+        let ifaces = self.send_ifaces.lock().unwrap().clone();
         let _guard = self.send_guard.lock().unwrap();
         let mut any = false;
         let mut last_err = None;
-        for &idx in &self.send_ifaces {
+        for &idx in &ifaces {
             let _ = self.socket.set_multicast_if_v6(idx);
             let scope_id = if link_scoped { idx } else { 0 };
             let dst: SocketAddr = SocketAddrV6::new(group_ip, port, 0, scope_id).into();
@@ -142,6 +151,29 @@ impl Net {
     pub fn group(&self) -> SocketAddrV6 {
         self.group
     }
+}
+
+/// Periodically join the group on any newly-appeared interfaces.
+fn spawn_iface_monitor(socket: Arc<Socket>, group: Ipv6Addr, send_ifaces: Arc<Mutex<Vec<u32>>>) {
+    thread::Builder::new()
+        .name("iface-monitor".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            for (idx, name) in multicast_interfaces() {
+                let already = send_ifaces.lock().unwrap().contains(&idx);
+                if already {
+                    continue;
+                }
+                match socket.join_multicast_v6(&group, idx) {
+                    Ok(()) => {
+                        log::info!("joined [{group}] on new interface {idx} ({name})");
+                        send_ifaces.lock().unwrap().push(idx);
+                    }
+                    Err(e) => log::debug!("join on interface {idx} ({name}): {e}"),
+                }
+            }
+        })
+        .expect("spawn iface monitor");
 }
 
 fn spawn_reader(socket: Arc<Socket>, tx: Sender<(Envelope, SocketAddr)>) {
